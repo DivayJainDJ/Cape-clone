@@ -9,8 +9,17 @@ async function buildCommutePlan(context) {
   if (!context.nextMeetingMinutes || context.nextMeetingMinutes > 180) return null;
 
   const rawDestination = context.nextMeetingLocation || context.destination || '';
-  const destination = await resolveDestination(rawDestination);
   const origin = context.currentLocation;
+  let destination = null;
+  try {
+    destination = await resolveDestination(rawDestination);
+  } catch (error) {
+    return {
+      ...unavailablePlan(context, context.nextMeetingLocation || context.destination),
+      source: 'maps_unavailable',
+      reason: `Destination lookup unavailable: ${error.message}`
+    };
+  }
   const fallback = unavailablePlan(context, destination?.label || context.nextMeetingLocation || context.destination);
 
   if (!process.env.GOOGLE_MAPS_API_KEY || !destination || !origin?.lat || !origin?.lng) {

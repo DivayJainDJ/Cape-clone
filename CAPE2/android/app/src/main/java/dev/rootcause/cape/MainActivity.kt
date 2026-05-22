@@ -23,6 +23,7 @@ import android.provider.CalendarContract
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
@@ -93,6 +94,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -271,13 +273,24 @@ class CapeSyncService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var lastStressScore = 0
     private var hasScheduledSync = false
+    private var lastGatewaySignature: String? = null
+    private var lastGatewaySyncAt: Long = 0L
     private val syncRunnable = object : Runnable {
         override fun run() {
             Thread {
                 val collector = ContextCollector(applicationContext)
                 val snapshot = collector.collect().snapshot
-                val decision = runCatching { GatewayClient().requestDecision(snapshot) }
-                    .getOrElse { DecisionOrchestrator().decide(snapshot) }
+                val shouldCallGateway = shouldSendGatewaySnapshot(snapshot, lastGatewaySignature, lastGatewaySyncAt)
+                val decision = if (shouldCallGateway) {
+                    runCatching { GatewayClient().requestDecision(snapshot) }
+                        .onSuccess {
+                            lastGatewaySignature = gatewaySyncSignature(snapshot)
+                            lastGatewaySyncAt = System.currentTimeMillis()
+                        }
+                        .getOrElse { DecisionOrchestrator().decide(snapshot) }
+                } else {
+                    DecisionOrchestrator().decide(snapshot)
+                }
                 val plan = decision.commutePlan
                 val cache = loadCommuteCache(applicationContext).toMutableMap()
                 resolveCommuteCacheEntry(snapshot, cache)
@@ -834,7 +847,7 @@ private fun HomeShell(onRequestRuntimePermissions: () -> Unit) {
                         } else {
                             decision
                         }
-                        pendingApproval = executableDecision
+                        pendingApproval = applyUserPackPreferences(context, executableDecision)
                     },
                     onApplyDemoWallpaper = { wallpaperAction ->
                         val demoDecision = decision.copy(
@@ -845,7 +858,7 @@ private fun HomeShell(onRequestRuntimePermissions: () -> Unit) {
                             blockedByPermission = emptyList(),
                             explanation = "Manual wallpaper demo action."
                         )
-                        pendingApproval = demoDecision
+                        pendingApproval = applyUserPackPreferences(context, demoDecision)
                     },
                     executionStatus = executionStatus
                 )
@@ -1732,6 +1745,19 @@ private fun ProfileSection(snapshot: ContextSnapshot) {
     var endTime by remember { mutableStateOf(prefs.getString(KEY_ROUTINE_END, "16:00") ?: "16:00") }
     var status by remember { mutableStateOf("") }
     var places by remember(snapshot.savedPlaces) { mutableStateOf(snapshot.savedPlaces) }
+    var wallpaperTarget by remember { mutableStateOf<String?>(null) }
+    var wallpaperTargetPack by remember { mutableStateOf<String?>(null) }
+    var wallpaperPrefsVersion by remember { mutableStateOf(0) }
+    val wallpaperPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val target = wallpaperTarget
+        if (uri != null && target != null) {
+            saveCustomWallpaperPreference(context, target, uri, wallpaperTargetPack)
+            wallpaperPrefsVersion += 1
+            status = "Saved custom wallpaper for ${wallpaperLabel(target, wallpaperTargetPack)}."
+        }
+        wallpaperTarget = null
+        wallpaperTargetPack = null
+    }
 
     // ── Avatar / Profile Header ───────────────────────────────────────────────
     Box(
@@ -1984,6 +2010,164 @@ private fun ProfileSection(snapshot: ContextSnapshot) {
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold
                     )
+                }
+            }
+        }
+    }
+
+    GlassCard {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("⚙️", fontSize = 16.sp)
+            Text("Pack Controls", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+        }
+        Text(
+            "Choose what CAPE is allowed to change for each scenario. You can also personalize the wallpaper and brightness level for each pack.",
+            color = CapeMuted,
+            fontSize = 12.sp
+        )
+
+        val packConfigs = listOf(
+            "office_focus_high_stress" to "Office / Class",
+            "commute_alert" to "Commute",
+            "home_evening" to "Home",
+            "recovery_mode" to "Recovery"
+        )
+        val categories = listOf(
+            "dnd_sound" to "DND + sound",
+            "brightness" to "Brightness",
+            "wallpaper" to "Wallpaper",
+            "notifications" to "Notifications / reminders"
+        )
+
+        packConfigs.forEach { (packId, title) ->
+            val wallpaperAction = wallpaperActionForPack(packId)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(GlassWhite.copy(alpha = 0.75f), RoundedCornerShape(14.dp))
+                    .border(1.dp, CapeGlassBorder, RoundedCornerShape(14.dp))
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(title, fontWeight = FontWeight.Bold, color = CapeText)
+                categories.forEach { (category, label) ->
+                    var enabled by remember { mutableStateOf(loadPackPreference(context, packId, category)) }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(label, color = CapeText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                if (enabled) "CAPE can change this for ${title.lowercase()} mode."
+                                else "User keeps manual control for this setting.",
+                                color = CapeMuted,
+                                fontSize = 11.sp
+                            )
+                        }
+                        Switch(
+                            checked = enabled,
+                            onCheckedChange = {
+                                enabled = it
+                                savePackPreference(context, packId, category, it)
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = CapePrimary,
+                                uncheckedThumbColor = Color.White,
+                                uncheckedTrackColor = CapeOutlineVariant
+                            )
+                        )
+                    }
+                }
+
+                val brightnessEnabled = loadPackPreference(context, packId, "brightness")
+                val brightnessOverride = remember { mutableStateOf(loadPackBrightnessOverride(context, packId)) }
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.White.copy(alpha = 0.65f), RoundedCornerShape(12.dp))
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("Brightness level", color = CapeText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (!brightnessEnabled) "Turn on Brightness above to let CAPE apply a custom level for this pack."
+                        else brightnessOverride.value?.let { "Custom level: $it%" } ?: "Using CAPE's recommended brightness for this pack.",
+                        color = CapeMuted,
+                        fontSize = 11.sp
+                    )
+                    Slider(
+                        value = (brightnessOverride.value ?: defaultBrightnessForPack(packId)).toFloat(),
+                        onValueChange = { value ->
+                            val rounded = value.toInt().coerceIn(5, 100)
+                            brightnessOverride.value = rounded
+                            savePackBrightnessOverride(context, packId, rounded)
+                        },
+                        valueRange = 5f..100f,
+                        enabled = brightnessEnabled
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("5%", color = CapeMuted, fontSize = 11.sp)
+                        Text("${brightnessOverride.value ?: defaultBrightnessForPack(packId)}%", color = CapePrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text("100%", color = CapeMuted, fontSize = 11.sp)
+                    }
+                    if (brightnessEnabled) {
+                        TextButton(
+                            onClick = {
+                                clearPackBrightnessOverride(context, packId)
+                                brightnessOverride.value = null
+                                status = "$title brightness reverted to CAPE default."
+                            }
+                        ) { Text("Use CAPE recommended brightness") }
+                    }
+                }
+
+                if (wallpaperAction != null) {
+                    val savedUri = remember(wallpaperPrefsVersion) { loadCustomWallpaperPreference(context, wallpaperAction, packId) }
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color.White.copy(alpha = 0.65f), RoundedCornerShape(12.dp))
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("Wallpaper", color = CapeText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            savedUri?.let { "Custom wallpaper selected for $title." } ?: "Using CAPE's default wallpaper for $title.",
+                            color = if (savedUri != null) CapeGreen else CapeMuted,
+                            fontSize = 11.sp
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    wallpaperTarget = wallpaperAction
+                                    wallpaperTargetPack = packId
+                                    wallpaperPicker.launch(arrayOf("image/*"))
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                enabled = loadPackPreference(context, packId, "wallpaper")
+                            ) { Text("Choose image") }
+                            if (savedUri != null) {
+                                TextButton(
+                                    onClick = {
+                                        clearCustomWallpaperPreference(context, wallpaperAction, packId)
+                                        wallpaperPrefsVersion += 1
+                                        status = "Reverted ${wallpaperLabel(wallpaperAction, packId)} to default."
+                                    }
+                                ) { Text("Use CAPE default") }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2664,6 +2848,152 @@ private fun savePlaces(context: Context, places: List<SavedPlace>) {
     context.getSharedPreferences("cape_context", Context.MODE_PRIVATE).edit().putString("saved_places", array.toString()).apply()
 }
 
+private fun saveCustomWallpaperPreference(context: Context, action: String, uri: Uri, packId: String? = null) {
+    runCatching {
+        context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.getSharedPreferences("cape_context", Context.MODE_PRIVATE)
+        .edit()
+        .putString(customWallpaperPreferenceKey(action, packId), uri.toString())
+        .apply()
+}
+
+private fun loadCustomWallpaperPreference(context: Context, action: String, packId: String? = null): String? {
+    return context.getSharedPreferences("cape_context", Context.MODE_PRIVATE)
+        .getString(customWallpaperPreferenceKey(action, packId), null)
+        ?.takeIf { it.isNotBlank() }
+}
+
+private fun clearCustomWallpaperPreference(context: Context, action: String, packId: String? = null) {
+    context.getSharedPreferences("cape_context", Context.MODE_PRIVATE)
+        .edit()
+        .remove(customWallpaperPreferenceKey(action, packId))
+        .apply()
+}
+
+private fun customWallpaperPreferenceKey(action: String, packId: String? = null): String =
+    if (packId.isNullOrBlank()) "${KEY_CUSTOM_WALLPAPER_PREFIX}$action"
+    else "${KEY_CUSTOM_WALLPAPER_PREFIX}${packId}_$action"
+
+private fun wallpaperLabel(action: String, packId: String? = null): String =
+    when {
+        !packId.isNullOrBlank() -> when (packId) {
+            "office_focus_high_stress" -> "Office / Class wallpaper"
+            "commute_alert" -> "Commute wallpaper"
+            "home_evening" -> "Home wallpaper"
+            "recovery_mode" -> "Recovery wallpaper"
+            else -> "$packId wallpaper"
+        }
+        action == "WALLPAPER_FOCUS" -> "Focus pack"
+        action == "WALLPAPER_RELAX" -> "Relax pack"
+        action == "WALLPAPER_COMMUTE" -> "Commute pack"
+        action == "WALLPAPER_RESET" -> "Default pack"
+        else -> action.replace("WALLPAPER_", "").replace('_', ' ')
+    }
+
+private fun applyUserPackPreferences(context: Context, decision: CapeDecision): CapeDecision {
+    val allowedActions = decision.actions.filter { action ->
+        isActionEnabledForPack(context, decision.packId, action)
+    }
+    val removedActions = decision.actions.filterNot { it in allowedActions }
+    val personalizedActions = applyPackActionOverrides(context, decision.packId, allowedActions)
+    if (removedActions.isEmpty() && personalizedActions == decision.actions) return decision
+
+    val updatedExplanation = buildString {
+        append(decision.explanation)
+        if (removedActions.isNotEmpty()) {
+            append(" User preferences skipped: ")
+            append(removedActions.joinToString())
+            append('.')
+        }
+        if (personalizedActions != allowedActions) {
+            append(" Personalized pack settings applied.")
+        }
+    }
+
+    return decision.copy(
+        actions = personalizedActions,
+        explanation = updatedExplanation
+    )
+}
+
+private fun applyPackActionOverrides(context: Context, packId: String, actions: List<String>): List<String> {
+    val brightnessOverride = loadPackBrightnessOverride(context, packId)
+    return actions.map { action ->
+        when {
+            brightnessOverride != null && action.startsWith("BRIGHTNESS_") && action != "BRIGHTNESS_AUTO" ->
+                "BRIGHTNESS_LEVEL_${brightnessOverride.coerceIn(5, 100)}"
+            else -> action
+        }
+    }
+}
+
+private fun isActionEnabledForPack(context: Context, packId: String, action: String): Boolean {
+    val prefs = context.getSharedPreferences("cape_context", Context.MODE_PRIVATE)
+    val category = actionPreferenceCategory(action)
+    return prefs.getBoolean("${KEY_PACK_PREF_PREFIX}${packId}_${category}", true)
+}
+
+private fun savePackPreference(context: Context, packId: String, category: String, enabled: Boolean) {
+    context.getSharedPreferences("cape_context", Context.MODE_PRIVATE)
+        .edit()
+        .putBoolean("${KEY_PACK_PREF_PREFIX}${packId}_${category}", enabled)
+        .apply()
+}
+
+private fun loadPackPreference(context: Context, packId: String, category: String): Boolean {
+    return context.getSharedPreferences("cape_context", Context.MODE_PRIVATE)
+        .getBoolean("${KEY_PACK_PREF_PREFIX}${packId}_${category}", true)
+}
+
+private fun savePackBrightnessOverride(context: Context, packId: String, levelPercent: Int) {
+    context.getSharedPreferences("cape_context", Context.MODE_PRIVATE)
+        .edit()
+        .putInt("${KEY_PACK_PREF_PREFIX}${packId}_brightness_level", levelPercent.coerceIn(5, 100))
+        .apply()
+}
+
+private fun loadPackBrightnessOverride(context: Context, packId: String): Int? {
+    val prefs = context.getSharedPreferences("cape_context", Context.MODE_PRIVATE)
+    if (!prefs.contains("${KEY_PACK_PREF_PREFIX}${packId}_brightness_level")) return null
+    return prefs.getInt("${KEY_PACK_PREF_PREFIX}${packId}_brightness_level", defaultBrightnessForPack(packId))
+}
+
+private fun clearPackBrightnessOverride(context: Context, packId: String) {
+    context.getSharedPreferences("cape_context", Context.MODE_PRIVATE)
+        .edit()
+        .remove("${KEY_PACK_PREF_PREFIX}${packId}_brightness_level")
+        .apply()
+}
+
+private fun defaultBrightnessForPack(packId: String): Int =
+    when (packId) {
+        "office_focus_high_stress" -> 40
+        "commute_alert" -> 65
+        "recovery_mode" -> 50
+        "home_evening" -> 55
+        else -> 50
+    }
+
+private fun wallpaperActionForPack(packId: String): String? =
+    when (packId) {
+        "office_focus_high_stress" -> "WALLPAPER_FOCUS"
+        "commute_alert" -> "WALLPAPER_COMMUTE"
+        "home_evening" -> "WALLPAPER_RELAX"
+        "recovery_mode" -> "WALLPAPER_RELAX"
+        "observe_only" -> "WALLPAPER_RESET"
+        else -> null
+    }
+
+private fun actionPreferenceCategory(action: String): String =
+    when {
+        action.startsWith("DND_") || action.startsWith("RINGER_") -> "dnd_sound"
+        action.startsWith("BRIGHTNESS") -> "brightness"
+        action.startsWith("WALLPAPER_") -> "wallpaper"
+        action == "SEND_DEPARTURE_ALERT" || action == "SOFT_NOTIFICATIONS" || action == "BREAK_REMINDER" -> "notifications"
+        else -> "other"
+    }
+
 private fun resolvePlaceForSave(kind: String, query: String, selected: SavedPlace?, existing: SavedPlace?): SavedPlace? {
     if (query.isBlank()) return existing
     val resolved = selected?.takeIf { it.latitude != null && it.longitude != null }
@@ -3070,6 +3400,38 @@ private fun startCapeSyncService(context: Context) {
     } else {
         context.startService(intent)
     }
+}
+
+private fun gatewaySyncSignature(snapshot: ContextSnapshot): String {
+    return listOf(
+        snapshot.locationState,
+        snapshot.nextMeetingTitle.orEmpty(),
+        snapshot.nextMeetingMinutes?.toString().orEmpty(),
+        snapshot.todoPendingCount.toString(),
+        snapshot.todoUrgentCount.toString(),
+        snapshot.todoOverdueCount.toString(),
+        snapshot.sleepDebtMinutes.toString(),
+        snapshot.notificationCountLast30Min.toString(),
+        snapshot.appSwitchCountLast30Min.toString(),
+        snapshot.screenUnlockCountLast30Min.toString(),
+        snapshot.implicitWorkload,
+        snapshot.currentLatitude?.let { "%.3f".format(it) }.orEmpty(),
+        snapshot.currentLongitude?.let { "%.3f".format(it) }.orEmpty()
+    ).joinToString("|")
+}
+
+private fun shouldSendGatewaySnapshot(
+    snapshot: ContextSnapshot,
+    previousSignature: String?,
+    lastGatewaySyncAt: Long
+): Boolean {
+    val currentSignature = gatewaySyncSignature(snapshot)
+    if (previousSignature == null) return true
+    if (currentSignature != previousSignature) return true
+    if (snapshot.locationState == "commuting") return true
+    if ((snapshot.nextMeetingMinutes ?: Int.MAX_VALUE) <= 30) return true
+    if (snapshot.todoUrgentCount > 0 || snapshot.todoOverdueCount > 0) return true
+    return System.currentTimeMillis() - lastGatewaySyncAt >= 45 * 60_000L
 }
 
 private fun shouldShowReflection(previousLocation: String, snapshot: ContextSnapshot, prefs: android.content.SharedPreferences): Boolean {
@@ -3596,3 +3958,5 @@ private const val KEY_TODO_EDIT_HOURS = "todo_edit_hours"
 private const val KEY_LEARNED_TODO_HOURS = "learned_todo_update_hours"
 private const val KEY_LAST_TODO_EDIT_AT = "last_todo_edit_at"
 private const val KEY_DECISION_APPROVAL_EVENTS = "decision_approval_events"
+private const val KEY_CUSTOM_WALLPAPER_PREFIX = "custom_wallpaper_"
+private const val KEY_PACK_PREF_PREFIX = "pack_pref_"

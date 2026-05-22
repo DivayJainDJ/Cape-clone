@@ -30,6 +30,7 @@ function createOpenClawOrchestrator(options = {}) {
       try {
         const remote = await runtimeClient.runContextDecision(rawContext);
         const event = normalizeRemoteContextEvent(remote, runtimeClient);
+        await maybeSendTelegramAlert(runtimeDir, event.decision);
         persistSession(runtimeDir, event);
         return {
           decision: event.decision,
@@ -128,6 +129,7 @@ function createOpenClawOrchestrator(options = {}) {
       decision,
       agentTrace: session.agentTrace
     });
+    await maybeSendTelegramAlert(runtimeDir, decision);
     persistSession(runtimeDir, event);
 
     return {
@@ -489,3 +491,77 @@ module.exports = {
   renderSummary,
   renderSession
 };
+
+async function maybeSendTelegramAlert(runtimeDir, decision) {
+  if (!decision?.actions?.includes('SEND_DEPARTURE_ALERT')) return;
+  if (!decision?.commutePlan?.shouldAlert) return;
+
+  const token = String(process.env.TELEGRAM_BOT_TOKEN ?? '').trim();
+  const chatId = String(process.env.TELEGRAM_CHAT_ID ?? '').trim();
+  if (!token || !chatId || token.startsWith('replace_with')) return;
+
+  const alertKey = [
+    decision.packId,
+    decision.commutePlan.leaveByLocal,
+    decision.commutePlan.destination,
+    decision.commutePlan.etaMinutes
+  ].join('|');
+  if (wasTelegramAlertRecentlySent(runtimeDir, alertKey)) return;
+
+  const message = [
+    'CAPE Departure Alert',
+    `Leave by: ${decision.commutePlan.leaveByLocal ?? 'soon'}`,
+    `Destination: ${decision.commutePlan.destination ?? 'upcoming meeting'}`,
+    `ETA: ${decision.commutePlan.etaMinutes ?? 'n/a'} min`,
+    `Buffer: ${decision.commutePlan.bufferMinutes ?? 'n/a'} min`,
+    decision.reasoningNote ? `Why: ${decision.reasoningNote}` : null
+  ].filter(Boolean).join('\n');
+
+  const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: message
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`telegram_send_failed:${response.status}`);
+  }
+
+  markTelegramAlertSent(runtimeDir, alertKey);
+}
+
+function telegramAlertCachePath(runtimeDir) {
+  return path.join(runtimeDir, 'telegram-alert-cache.json');
+}
+
+function wasTelegramAlertRecentlySent(runtimeDir, alertKey) {
+  const cachePath = telegramAlertCachePath(runtimeDir);
+  if (!fs.existsSync(cachePath)) return false;
+  try {
+    const cache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    const sentAt = Number(cache[alertKey] ?? 0);
+    return sentAt > 0 && (Date.now() - sentAt) < (20 * 60 * 1000);
+  } catch {
+    return false;
+  }
+}
+
+function markTelegramAlertSent(runtimeDir, alertKey) {
+  const cachePath = telegramAlertCachePath(runtimeDir);
+  let cache = {};
+  try {
+    if (fs.existsSync(cachePath)) {
+      cache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    }
+  } catch {
+    cache = {};
+  }
+  cache[alertKey] = Date.now();
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  fs.writeFileSync(cachePath, JSON.stringify(cache, null, 2));
+}

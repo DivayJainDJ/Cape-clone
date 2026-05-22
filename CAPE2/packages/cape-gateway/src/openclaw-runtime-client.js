@@ -1,7 +1,7 @@
 function createOpenClawRuntimeClient(options = {}) {
   const baseUrl = normalizeBaseUrl(options.baseUrl ?? process.env.OPENCLAW_BASE_URL);
   const token = options.token ?? process.env.OPENCLAW_TOKEN;
-  const agentId = options.agentId ?? process.env.OPENCLAW_AGENT_ID ?? 'cape';
+  const agentId = normalizeAgentId(options.agentId ?? process.env.OPENCLAW_AGENT_ID);
   const timeoutMs = Number(options.timeoutMs ?? process.env.OPENCLAW_TIMEOUT_MS ?? 45000);
   const method = options.method ?? process.env.OPENCLAW_AGENT_METHOD ?? 'agent';
   const required = asBoolean(options.required ?? process.env.OPENCLAW_REQUIRED);
@@ -194,6 +194,11 @@ function asBoolean(value) {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'string') return value.toLowerCase() === 'true';
   return Boolean(value);
+}
+
+function normalizeAgentId(value) {
+  const text = String(value ?? '').trim();
+  return text || 'cape';
 }
 
 module.exports = {

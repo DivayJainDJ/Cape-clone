@@ -4,6 +4,7 @@ import android.app.WallpaperManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.net.Uri
 import android.media.AudioManager
 import android.os.Build
 import android.provider.Settings
@@ -13,7 +14,13 @@ import dev.rootcause.cape.R
 import dev.rootcause.cape.core.CapeDecision
 
 class PackExecutor(private val context: Context) {
-    fun applyWallpaperAction(action: String): Boolean {
+    fun applyWallpaperAction(action: String, packId: String? = null): Boolean {
+        loadCustomWallpaperUri(action, packId)?.let { stored ->
+            if (setWallpaper(Uri.parse(stored))) return true
+        }
+        loadCustomWallpaperUri(action)?.let { stored ->
+            if (setWallpaper(Uri.parse(stored))) return true
+        }
         return when (action) {
             "WALLPAPER_FOCUS" -> setWallpaper(R.drawable.wallpaper_focus)
             "WALLPAPER_RELAX" -> setWallpaper(R.drawable.wallpaper_relax)
@@ -41,11 +48,14 @@ class PackExecutor(private val context: Context) {
                 "BRIGHTNESS_50" -> if (setBrightness(128)) applied.add(action) else blocked.add(action)
                 "BRIGHTNESS_65" -> if (setBrightness(166)) applied.add(action) else blocked.add(action)
                 "BRIGHTNESS_AUTO" -> if (setAutomaticBrightness()) applied.add(action) else blocked.add(action)
-                "WALLPAPER_FOCUS", "WALLPAPER_RELAX", "WALLPAPER_COMMUTE", "WALLPAPER_RESET" -> if (applyWallpaperAction(action)) applied.add(action) else blocked.add(action)
+                "WALLPAPER_FOCUS", "WALLPAPER_RELAX", "WALLPAPER_COMMUTE", "WALLPAPER_RESET" -> if (applyWallpaperAction(action, decision.packId)) applied.add(action) else blocked.add(action)
                 "SEND_DEPARTURE_ALERT" -> if (sendNotification("CAPE commute alert", "Leave soon to stay on time.")) applied.add(action) else blocked.add(action)
                 "SOFT_NOTIFICATIONS" -> if (sendNotification("CAPE recovery mode", "Using low-intrusion behavior today.")) applied.add(action) else blocked.add(action)
                 "BREAK_REMINDER" -> if (sendNotification("CAPE break reminder", "Take a short reset when you can.")) applied.add(action) else blocked.add(action)
-                else -> blocked.add(action)
+                else -> when {
+                    inBrightnessLevelAction(action) -> if (setBrightness(percentToBrightnessValue(extractBrightnessPercent(action)))) applied.add(action) else blocked.add(action)
+                    else -> blocked.add(action)
+                }
             }
         }
 
@@ -110,6 +120,38 @@ class PackExecutor(private val context: Context) {
         }
     }
 
+    private fun setWallpaper(uri: Uri): Boolean {
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                WallpaperManager.getInstance(context).setStream(input)
+            } ?: return false
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun loadCustomWallpaperUri(action: String, packId: String? = null): String? {
+        val prefs = context.getSharedPreferences("cape_context", Context.MODE_PRIVATE)
+        val key = if (packId.isNullOrBlank()) {
+            "${KEY_CUSTOM_WALLPAPER_PREFIX}$action"
+        } else {
+            "${KEY_CUSTOM_WALLPAPER_PREFIX}${packId}_$action"
+        }
+        return prefs.getString(key, null)
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun inBrightnessLevelAction(action: String): Boolean = action.startsWith("BRIGHTNESS_LEVEL_")
+
+    private fun extractBrightnessPercent(action: String): Int {
+        return action.removePrefix("BRIGHTNESS_LEVEL_").toIntOrNull()?.coerceIn(5, 100) ?: 50
+    }
+
+    private fun percentToBrightnessValue(percent: Int): Int {
+        return ((percent.coerceIn(5, 100) / 100f) * 255f).toInt().coerceIn(1, 255)
+    }
+
     private fun sendNotification(title: String, body: String): Boolean {
         recordNotificationEvent()
         val channelId = "cape_demo"
@@ -143,5 +185,9 @@ class PackExecutor(private val context: Context) {
             .mapNotNull { it.toLongOrNull() }
             .filter { it >= cutoff } + now
         prefs.edit().putString("notification_events", values.joinToString(",")).apply()
+    }
+
+    companion object {
+        private const val KEY_CUSTOM_WALLPAPER_PREFIX = "custom_wallpaper_"
     }
 }
